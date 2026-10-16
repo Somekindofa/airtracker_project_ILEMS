@@ -1,5 +1,4 @@
 import os
-
 import geopandas as gpd
 import matplotlib.pyplot as plt
 from dotenv import load_dotenv
@@ -10,8 +9,6 @@ def load_layers() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     load_dotenv()
     idf = gpd.read_file(os.environ["URL_IDF"]).query("CODE_DEPT in ['94', '93', '92', '75']")
     runways = gpd.read_file(os.environ["URL_RUNWAYS"])
-
-    # Reproject to lat/lon so it matches ADS-B coordinates later
     idf = idf.to_crs(epsg=4326)
     runways = runways.to_crs(epsg=4326)
     return idf, runways
