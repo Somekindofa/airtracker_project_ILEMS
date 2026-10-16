@@ -13,3 +13,4 @@ geoflar-departements/
 *.sbn
 *.sbx
 *.qix
+*.env
