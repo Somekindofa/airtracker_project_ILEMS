@@ -3,11 +3,11 @@ Aircraft trajectories over the Petite Couronne (75, 92, 93, 94).
 
 Classes
 -------
-BaseMap               : departments + airports layers (your existing code)
+BaseMap               : departments + airports layers
 AdsbLoader            : reads the .jsonl and returns a clean positions DataFrame
-Flights            : one aircraft (icao24), with its callsign and points
-FlightsCollection  : all aircraft: iteration, summary, GeoDataFrame export
-MapPlotter            : draws base map + airports + trajectories
+Flights               : one aircraft (icao24), with its callsign, points, vrate
+FlightsCollection     : all aircraft: iteration, summary, GeoDataFrame export
+MapPlotter            : draws base map + airports + trajectories + histograms
 
 .env must define URL_IDF, URL_AIRPORTS and URL_Avions_MCD.
 """
@@ -21,11 +21,14 @@ from typing import Optional
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+from matplotlib.lines import Line2D
 from shapely.geometry import LineString
 
 load_dotenv()
+
 
 @dataclass(frozen=True)
 class Airfield:
@@ -45,9 +48,11 @@ class BaseMap:
         Airfield("Toussus-le-Noble", 48.7519, 2.1061),
     )
 
-    def __init__(self, idf_path: str, airports_path: str, epsg: int = 4326,include_grande_couronne: bool = True,airfields: tuple[Airfield, ...] = DEFAULT_AIRFIELDS):
+    def __init__(self, idf_path: str, airports_path: str, epsg: int = 4326,
+                 include_grande_couronne: bool = True,
+                 airfields: tuple[Airfield, ...] = DEFAULT_AIRFIELDS):
         self.epsg = epsg
-        
+
         idf = gpd.read_file(idf_path).to_crs(epsg=epsg)
         idf["CODE_DEPT"] = idf["CODE_DEPT"].astype(str)
 
@@ -79,11 +84,13 @@ class BaseMap:
         return self.petite_couronne.total_bounds
 
 
+# --------------------------------------------------------------------------- #
+# CPR decoding (airborne positions, 17-bit)
+# --------------------------------------------------------------------------- #
 class CprDecoder:
     """
     Local CPR decoding: lat/lon from ONE message + a reference position
     (valid within ~300 km of the reference, fine for a receiver in Paris).
-    Used to recover the positions that the file left undecoded.
     """
 
     NZ = 15
@@ -113,21 +120,26 @@ class CprDecoder:
             0.5 + (self.ref_lon % d_lon) / d_lon - lon_c)
         return lat, d_lon * (m + lon_c)
 
+
+# --------------------------------------------------------------------------- #
+# ADS-B loading
+# --------------------------------------------------------------------------- #
 class AdsbLoader:
     """
-    Position messages (latitude/longitude) do NOT contain the callsign:
-    it is sent in separate identification messages. So we group by icao24
-    and attach the callsign afterwards.
+    Position messages (lat/lon) and vertical-rate messages arrive in separate
+    rows. We group by icao24, attach the callsign, and merge the nearest vrate
+    sample onto every position.
     """
+    VRATE_SOURCES = ("vertical_rate", "vrate_barometric", "vrate_inertial")
 
     def __init__(self, path: str, reference: tuple[float, float] = (48.80, 2.33),
-                 decode_missing: bool = True):
+                 decode_missing: bool = True, vrate_tolerance_s: float = 2.0):
         self.path = path
-        self.decoder = CprDecoder(*reference)  # reference ~ receiver (Arcueil)
+        self.decoder = CprDecoder(*reference)
         self.decode_missing = decode_missing
+        self.vrate_tolerance_s = vrate_tolerance_s
 
     def _fill_missing_positions(self, raw: pd.DataFrame) -> pd.DataFrame:
-        """Rows with raw CPR but no decoded lat/lon -> decode them locally."""
         todo = raw["lat_cpr"].notna() & raw["latitude"].isna()
         for idx, r in raw[todo].iterrows():
             lat, lon = self.decoder.decode(r["lat_cpr"], r["lon_cpr"], r["parity"] == "odd")
@@ -135,11 +147,24 @@ class AdsbLoader:
         print(f"{todo.sum()} positions recovered from raw CPR")
         return raw
 
+    def _coalesce_vrate(self, raw: pd.DataFrame) -> pd.DataFrame:
+        """Merge the several vertical-rate sources into a single 'vrate' column."""
+        for col in self.VRATE_SOURCES:
+            if col not in raw.columns:
+                raw[col] = pd.NA
+        vrate = raw[self.VRATE_SOURCES[0]]
+        for col in self.VRATE_SOURCES[1:]:
+            vrate = vrate.fillna(raw[col])
+        raw["vrate"] = pd.to_numeric(vrate, errors="coerce")
+        return raw
+
     def load(self) -> pd.DataFrame:
         raw = pd.read_json(self.path, lines=True, convert_dates=False)
         if self.decode_missing:
             raw = self._fill_missing_positions(raw)
+        raw = self._coalesce_vrate(raw)
 
+        # ---- callsign per icao24 ------------------------------------------
         callsigns = (
             raw.dropna(subset=["callsign"])
             .assign(callsign=lambda d: d["callsign"].str.strip().str.rstrip("_"))
@@ -147,13 +172,37 @@ class AdsbLoader:
             .set_index("icao24")["callsign"]
         )
 
+        # ---- position rows ------------------------------------------------
         pos = raw.dropna(subset=["latitude", "longitude"]).copy()
+        # The position rows do NOT carry a real vertical rate (it lives in
+        # other message types), so drop the placeholder column added by
+        # _coalesce_vrate before merging; otherwise the merge renames both
+        # to vrate_x / vrate_y.
+        pos = pos.drop(columns=["vrate"], errors="ignore")
         pos["time"] = pd.to_datetime(pos["timestamp"], unit="s", utc=True)
         pos["callsign"] = pos["icao24"].map(callsigns)
         pos["label"] = pos["callsign"].fillna(pos["icao24"])
 
+        # merge_asof requires the `on` key to be globally sorted.
+        pos = pos.sort_values("timestamp").reset_index(drop=True)
+
+        # ---- nearest vrate sample attached to each position ---------------
+        vr = (
+            raw.dropna(subset=["vrate"])[["icao24", "timestamp", "vrate"]]
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        if len(vr):
+            pos = pd.merge_asof(
+                pos, vr,
+                on="timestamp", by="icao24",
+                direction="nearest", tolerance=self.vrate_tolerance_s,
+            )
+        else:
+            pos["vrate"] = pd.NA
+
         cols = ["icao24", "callsign", "label", "timestamp", "time",
-                "latitude", "longitude", "altitude"]
+                "latitude", "longitude", "altitude", "vrate"]
         return (
             pos[cols]
             .sort_values(["icao24", "timestamp"])
@@ -161,6 +210,10 @@ class AdsbLoader:
             .reset_index(drop=True)
         )
 
+
+# --------------------------------------------------------------------------- #
+# One aircraft
+# --------------------------------------------------------------------------- #
 @dataclass
 class Flights:
     icao24: str
@@ -196,6 +249,61 @@ class Flights:
     def __len__(self) -> int:
         return len(self.data)
 
+    # ------------------------------------------------------------------ NEW --
+    def mean_vrate(self, altitude_max: Optional[float] = None) -> Optional[float]:
+        """Mean vertical rate over the flight (ft/min).
+
+        If `altitude_max` is given, only samples at or below that altitude are
+        used — useful to focus on the takeoff/landing phase rather than on
+        cruise where vrate ≈ 0 by construction.
+        """
+        if "vrate" not in self.data.columns:
+            return None
+        d = self.data.dropna(subset=["vrate"])
+        if altitude_max is not None:
+            d = d[d["altitude"] <= altitude_max]
+        if not len(d):
+            return None
+        return float(d["vrate"].mean())
+
+    def phase(self,
+              takeoff_min: float = 200.0,
+              landing_max: float = -200.0,
+              altitude_max: Optional[float] = None,
+              fallback_ground_ft: float = 3000.0,
+              fallback_delta_ft: float = 1500.0) -> str:
+        """Classify the flight as 'takeoff', 'landing' or 'cruising'.
+
+        Primary rule (vrate-based): compare the mean vertical rate of the
+        flight to the two thresholds `takeoff_min` and `landing_max` that
+        the user reads off the vrate histogram.
+
+        Fallback (altitude-delta) is used only when no vrate sample is
+        available for the flight.
+        """
+        m = self.mean_vrate(altitude_max=altitude_max)
+        if m is not None:
+            if m >= takeoff_min:
+                return "takeoff"
+            if m <= landing_max:
+                return "landing"
+            return "cruising"
+
+        # ---- fallback: altitude-delta --------------------------------
+        alt = self.data["altitude"].dropna()
+        if len(alt) < 3:
+            return "cruising"
+        k = max(2, len(alt) // 10)
+        start = float(alt.head(k).median())
+        end = float(alt.tail(k).median())
+        delta = end - start
+        if start <= fallback_ground_ft and delta >= fallback_delta_ft:
+            return "takeoff"
+        if end <= fallback_ground_ft and -delta >= fallback_delta_ft:
+            return "landing"
+        return "cruising"
+    # ------------------------------------------------------------------------
+
     def segments(self, max_gap_s: Optional[float] = None) -> list[pd.DataFrame]:
         """Split the track where reception stopped for more than max_gap_s."""
         if max_gap_s is None:
@@ -213,6 +321,10 @@ class Flights:
     def __repr__(self) -> str:
         return f"Flights({self.label!r}, {len(self)} pts)"
 
+
+# --------------------------------------------------------------------------- #
+# All aircraft
+# --------------------------------------------------------------------------- #
 class FlightsCollection:
     def __init__(self, trajectories: list[Flights]):
         self._trajs = trajectories
@@ -232,7 +344,6 @@ class FlightsCollection:
         return FlightsCollection([t for t in self._trajs if len(t) >= n])
 
     def filter_low_altitude(self, threshold_ft: float = 3000) -> "FlightsCollection":
-        
         return FlightsCollection(
             [t for t in self._trajs
              if t.min_altitude is not None and t.min_altitude < threshold_ft]
@@ -248,19 +359,52 @@ class FlightsCollection:
                 out.append(Flights(t.icao24, d.reset_index(drop=True)))
         return FlightsCollection(out)
 
-    def summary(self) -> pd.DataFrame:
-        """Replaces your groupby('callsign').agg(...) -- but on icao24."""
+    # ------------------------------------------------------------------ NEW --
+    def min_altitudes(self) -> pd.Series:
+        """Minimum altitude per flight, indexed by icao24 (NaN dropped)."""
+        return pd.Series(
+            {t.icao24: t.min_altitude for t in self._trajs}
+        ).dropna().astype(float)
+
+    def mean_vrates(self, altitude_max: Optional[float] = None) -> pd.Series:
+        """Mean vertical rate per flight, indexed by icao24 (NaN dropped)."""
+        return pd.Series(
+            {t.icao24: t.mean_vrate(altitude_max=altitude_max) for t in self._trajs}
+        ).dropna().astype(float)
+
+    def by_phase(self, **phase_kwargs) -> dict[str, "FlightsCollection"]:
+        """Return {'takeoff': ..., 'landing': ..., 'cruising': ...}."""
+        buckets: dict[str, list[Flights]] = {"takeoff": [], "landing": [], "cruising": []}
+        for t in self._trajs:
+            buckets[t.phase(**phase_kwargs)].append(t)
+        return {k: FlightsCollection(v) for k, v in buckets.items()}
+
+    def takeoffs(self, **phase_kwargs) -> "FlightsCollection":
+        return self.by_phase(**phase_kwargs)["takeoff"]
+
+    def landings(self, **phase_kwargs) -> "FlightsCollection":
+        return self.by_phase(**phase_kwargs)["landing"]
+    # ------------------------------------------------------------------------
+
+    def summary(self, **phase_kwargs) -> pd.DataFrame:
+        """One row per flight, including its phase."""
         return pd.DataFrame(
             [{"icao24": t.icao24, "callsign": t.callsign, "count": len(t),
-              "min": t.start, "max": t.end, "min_alt": t.min_altitude, "max_alt": t.max_altitude}
+              "min": t.start, "max": t.end,
+              "min_alt": t.min_altitude, "max_alt": t.max_altitude,
+              "mean_vrate": t.mean_vrate(),
+              "phase": t.phase(**phase_kwargs)}
              for t in self._trajs]
         ).set_index("icao24")
 
     def to_geodataframe(self, max_gap_s: Optional[float] = None,
-                        epsg: int = 4326) -> gpd.GeoDataFrame:
+                        epsg: int = 4326, **phase_kwargs) -> gpd.GeoDataFrame:
         rows = [
-            {"icao24": t.icao24, "callsign": t.label, "min_alt": t.min_altitude,
-             "max_alt": t.max_altitude, "geometry": line}
+            {"icao24": t.icao24, "callsign": t.label,
+             "min_alt": t.min_altitude, "max_alt": t.max_altitude,
+             "mean_vrate": t.mean_vrate(),
+             "phase": t.phase(**phase_kwargs),
+             "geometry": line}
             for t in self._trajs
             for line in t.to_linestrings(max_gap_s)
         ]
@@ -279,21 +423,8 @@ class MapPlotter:
         self.basemap = basemap
         self.figsize = figsize
 
-    def diagnose(self, trajectories: FlightsCollection) -> None:
-        """Compare the extents (lon/lat) of the base map and the trajectories."""
-        g = trajectories.to_geodataframe(epsg=self.basemap.epsg)
-        print("basemap      [minx miny maxx maxy]:", self.basemap.bounds.round(3))
-        print("trajectories [minx miny maxx maxy]:", g.total_bounds.round(3))
-        print("basemap CRS:", self.basemap.departments.crs)
-
-    def plot(self, trajectories: FlightsCollection,
-             max_gap_s: Optional[float] = None,
-             zoom_on: str = "basemap",   # "basemap" | "petite_couronne" | "trajectories"
-             color_by_altitude: bool = True,
-             color_column: str = "min_alt",   # "min_alt" or "max_alt"
-             labels: bool = False):
-        fig, ax = plt.subplots(figsize=self.figsize)
-
+    # -------------------------------------------------------------- helpers --
+    def _draw_basemap(self, ax) -> None:
         bm = self.basemap
         if len(bm.grande_couronne):
             bm.grande_couronne.plot(ax=ax, color="#D9D6D6",
@@ -301,58 +432,224 @@ class MapPlotter:
         bm.petite_couronne.plot(ax=ax, color="#A29F9F",
                                 edgecolor="#0A0909", linewidth=0.5)
         bm.airports.plot(ax=ax, color="#A29F9F", edgecolor="#EE0808", linewidth=0.5)
-
-        # extra airfields (Villacoublay, Toussus...) as labelled red markers
         bm.airfields.plot(ax=ax, color="#EE0808", marker="^", markersize=30, zorder=5)
         for _, a in bm.airfields.iterrows():
             ax.annotate(a["name"], (a.geometry.x, a.geometry.y), fontsize=7,
                         xytext=(4, 4), textcoords="offset points", zorder=6)
 
+    def _apply_zoom(self, ax, gdf: gpd.GeoDataFrame, zoom_on: str) -> None:
+        if zoom_on == "petite_couronne":
+            minx, miny, maxx, maxy = self.basemap.petite_couronne_bounds
+        elif zoom_on == "trajectories" and len(gdf):
+            minx, miny, maxx, maxy = gdf.total_bounds
+        else:  # "basemap", or "trajectories" with nothing to draw
+            minx, miny, maxx, maxy = self.basemap.bounds
+        mx, my = (maxx - minx) * 0.03, (maxy - miny) * 0.03
+        ax.set_xlim(minx - mx, maxx + mx)
+        ax.set_ylim(miny - my, maxy + my)
+        ax.set_axis_off()
+    # ------------------------------------------------------------------------
+
+    def diagnose(self, trajectories: FlightsCollection) -> None:
+        g = trajectories.to_geodataframe(epsg=self.basemap.epsg)
+        print("basemap      [minx miny maxx maxy]:", self.basemap.bounds.round(3))
+        print("trajectories [minx miny maxx maxy]:", g.total_bounds.round(3))
+        print("basemap CRS:", self.basemap.departments.crs)
+
+    # ------------------------------------------------------------------ NEW --
+    def plot_altitude_vrate_histograms(self, trajectories: FlightsCollection,
+                                       bins: int = 40,
+                                       altitude_max_for_vrate: Optional[float] = None,
+                                       ax_size: tuple = (13, 5)):
+        """Two side-by-side histograms to help pick the two thresholds:
+
+        Left  : minimum altitude per flight -> gives the 'ground' altitude.
+        Right : mean vertical rate per flight -> gives takeoff/landing thresholds.
+        """
+        fig, axes = plt.subplots(1, 2, figsize=ax_size)
+
+        # ---- 1) minimum altitude per flight -------------------------------
+        min_alts = trajectories.min_altitudes()
+        axes[0].hist(min_alts, bins=bins, edgecolor="black", alpha=0.75, color="C0")
+        axes[0].set_xlabel("Minimum altitude per flight (ft)")
+        axes[0].set_ylabel("Number of flights")
+        axes[0].set_title(f"Min altitude per flight   (n = {len(min_alts)})")
+        axes[0].grid(True, alpha=0.3)
+        if len(min_alts):
+            for q, c, ls in [(0.25, "C3", "--"), (0.5, "k", "-"),
+                             (0.75, "C3", "--")]:
+                v = min_alts.quantile(q)
+                axes[0].axvline(v, color=c, ls=ls, lw=1,
+                                label=f"Q{int(q*100)} = {v:.0f} ft")
+            axes[0].legend(fontsize=8, loc="upper right")
+
+        # ---- 2) mean vrate per flight -------------------------------------
+        mean_vr = trajectories.mean_vrates(altitude_max=altitude_max_for_vrate)
+        axes[1].hist(mean_vr, bins=bins, edgecolor="black", alpha=0.75, color="C1")
+        axes[1].set_xlabel("Mean vertical rate per flight (ft/min)")
+        axes[1].set_ylabel("Number of flights")
+        title = f"Mean vrate per flight   (n = {len(mean_vr)})"
+        if altitude_max_for_vrate is not None:
+            title += f"   |   below {altitude_max_for_vrate:.0f} ft"
+        axes[1].set_title(title)
+        axes[1].grid(True, alpha=0.3)
+        axes[1].axvline(0, color="black", lw=1)
+        if len(mean_vr):
+            for q, c, ls in [(0.1, "C3", ":"), (0.25, "C3", "--"),
+                             (0.5, "k", "-"),
+                             (0.75, "C3", "--"), (0.9, "C3", ":")]:
+                v = mean_vr.quantile(q)
+                axes[1].axvline(v, color=c, ls=ls, lw=1,
+                                label=f"Q{int(q*100)} = {v:.0f}")
+            axes[1].legend(fontsize=8, loc="upper right")
+
+        plt.tight_layout()
+        return fig, axes
+    # ------------------------------------------------------------------------
+
+    def plot(self, trajectories: FlightsCollection,
+             max_gap_s: Optional[float] = None,
+             zoom_on: str = "basemap",
+             color_by_altitude: bool = True,
+             color_column: str = "min_alt",
+             labels: bool = False):
+        fig, ax = plt.subplots(figsize=self.figsize)
+        self._draw_basemap(ax)
+
         gdf = trajectories.to_geodataframe(max_gap_s, self.basemap.epsg)
-        if color_by_altitude:
-            gdf.plot(ax=ax, column=color_column, cmap="viridis", linewidth=1,
-                     legend=True, legend_kwds={"label": f"{color_column} (ft)",
-                                               "shrink": 0.6}, zorder=3)
-        else:
-            gdf.plot(ax=ax, color="#1f77b4", linewidth=1, zorder=3)
+        if len(gdf):
+            if color_by_altitude:
+                gdf.plot(ax=ax, column=color_column, cmap="viridis", linewidth=1,
+                         legend=True,
+                         legend_kwds={"label": f"{color_column} (ft)", "shrink": 0.6},
+                         zorder=3)
+            else:
+                gdf.plot(ax=ax, color="#1f77b4", linewidth=1, zorder=3)
 
         if labels:
             for _, r in gdf.iterrows():
                 x, y = r.geometry.coords[-1]
                 ax.annotate(r["callsign"], (x, y), fontsize=6, zorder=4)
 
-        # Most flights are outside the Petite Couronne: choose the zoom
-        if zoom_on == "basemap":
-            minx, miny, maxx, maxy = self.basemap.bounds
-        elif zoom_on == "petite_couronne":
-            minx, miny, maxx, maxy = self.basemap.petite_couronne_bounds
-        else:
-            minx, miny, maxx, maxy = gdf.total_bounds
-        mx, my = (maxx - minx) * 0.03, (maxy - miny) * 0.03
-        ax.set_xlim(minx - mx, maxx + mx)
-        ax.set_ylim(miny - my, maxy + my)
-        ax.set_axis_off()
+        self._apply_zoom(ax, gdf, zoom_on)
         return fig, ax
+
+    # ------------------------------------------------------------------ NEW --
+    def plot_phases(self, trajectories: FlightsCollection,
+                    max_gap_s: Optional[float] = None,
+                    zoom_on: str = "basemap",
+                    takeoff_color: str = "#1a9850",   # green
+                    landing_color: str = "#d73027",   # red
+                    cruise_color:  str = "#4575b4",   # blue
+                    show_cruise: bool = False,
+                    phase_kwargs: Optional[dict] = None,
+                    title: Optional[str] = None):
+        """Same basemap as `plot`, with the three phases in distinct colours."""
+        phase_kwargs = phase_kwargs or {}
+        fig, ax = plt.subplots(figsize=self.figsize)
+        self._draw_basemap(ax)
+
+        parts = trajectories.by_phase(**phase_kwargs)
+        takeoffs, landings, cruising = parts["takeoff"], parts["landing"], parts["cruising"]
+
+        if show_cruise and len(cruising):
+            g = cruising.to_geodataframe(max_gap_s, self.basemap.epsg)
+            if len(g):
+                g.plot(ax=ax, color=cruise_color, linewidth=0.7,
+                       alpha=0.8, zorder=2)
+
+        if len(takeoffs):
+            g = takeoffs.to_geodataframe(max_gap_s, self.basemap.epsg)
+            if len(g):
+                g.plot(ax=ax, color=takeoff_color, linewidth=1.4, zorder=3)
+
+        if len(landings):
+            g = landings.to_geodataframe(max_gap_s, self.basemap.epsg)
+            if len(g):
+                g.plot(ax=ax, color=landing_color, linewidth=1.4, zorder=4)
+
+        handles = [
+            Line2D([0], [0], color=takeoff_color, lw=2.5,
+                   label=f"Takeoff ({len(takeoffs)})"),
+            Line2D([0], [0], color=landing_color, lw=2.5,
+                   label=f"Landing ({len(landings)})"),
+        ]
+        if show_cruise and len(cruising):
+            handles.append(Line2D([0], [0], color=cruise_color, lw=2.5,
+                                  label=f"Cruising ({len(cruising)})"))
+        ax.legend(handles=handles, loc="upper left", fontsize=8, framealpha=0.9)
+
+        if title:
+            ax.set_title(title)
+
+        all_gdf = trajectories.to_geodataframe(max_gap_s, self.basemap.epsg,
+                                               **phase_kwargs)
+        self._apply_zoom(ax, all_gdf, zoom_on)
+        return fig, ax
+    # ------------------------------------------------------------------------
 
 
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
+
     basemap = BaseMap.from_env()
     positions = AdsbLoader(os.environ["URL_Avions_MCD"]).load()
 
     trajs = FlightsCollection.from_dataframe(positions).filter_min_points(5)
-    print(trajs.summary())
 
     plotter = MapPlotter(basemap)
-    plotter.diagnose(trajs)
+
     minx, miny, maxx, maxy = basemap.bounds
     pad = 0.3
     local = trajs.crop_to_bbox(minx - pad, miny - pad, maxx + pad, maxy + pad)
     print(len(local), "aircraft near the Petite Couronne")
 
-    local = local.filter_low_altitude(3000)
-    print(len(local), "aircraft below 3000 ft (takeoff / landing)")
-    print(local.summary())
+    # ------------------------------------------------------------------ #
+    # 1) Diagnostic histograms to pick the two thresholds
+    # ------------------------------------------------------------------ #
+    fig_h, _ = plotter.plot_altitude_vrate_histograms(
+        local,
+        bins=40,
+        altitude_max_for_vrate=None,   # set e.g. 5000 to focus on low-altitude
+                                       # samples when computing mean vrate
+    )
 
+    # Print the quantiles so you can read them in the console too
+    min_alts = local.min_altitudes()
+    mean_vr  = local.mean_vrates()
+    print("\n--- Min altitude per flight (ft) ---")
+    print(min_alts.describe(percentiles=[.1, .25, .5, .75, .9]).round(1))
+    print("\n--- Mean vrate per flight (ft/min) ---")
+    print(mean_vr.describe(percentiles=[.1, .25, .5, .75, .9]).round(1))
+
+    # ------------------------------------------------------------------ #
+    # 2) Set the two thresholds from what you read on the histograms
+    # ------------------------------------------------------------------ #
+    TAKEOFF_MIN = 200.0    # ft/min  — flights with mean vrate >= this are climbing
+    LANDING_MAX = -200.0   # ft/min  — flights with mean vrate <= this are descending
+    ALT_MAX_FOR_VRATE = None   # or e.g. 5000 to restrict vrate to low altitude
+    phase_kwargs = dict(takeoff_min=TAKEOFF_MIN,
+                        landing_max=LANDING_MAX,
+                        altitude_max=ALT_MAX_FOR_VRATE)
+
+    # ------------------------------------------------------------------ #
+    # 3) Classification report
+    # ------------------------------------------------------------------ #
+    parts = local.by_phase(**phase_kwargs)
+    print(f"\n{len(parts['takeoff'])} takeoffs, "
+          f"{len(parts['landing'])} landings, "
+          f"{len(parts['cruising'])} cruising")
+    print(local.summary(**phase_kwargs))
+
+    # ------------------------------------------------------------------ #
+    # 4) Maps
+    # ------------------------------------------------------------------ #
+    # Map 1: altitude-coloured overview
     plotter.plot(local, max_gap_s=120, zoom_on="basemap")
+
+    # Map 2: takeoffs / landings / cruising in distinct colours
+    plotter.plot_phases(local, max_gap_s=120, zoom_on="basemap",
+                        phase_kwargs=phase_kwargs,
+                        title="Takeoffs / landings / cruising over the Petite Couronne")
+
     plt.show()
