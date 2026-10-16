@@ -17,4 +17,10 @@ geoflar-departements/
 # Python environment
 .venv/
 __pycache__/
+
+# Notebooks are local sandboxes only — never committed/shared
+*.ipynb
 .ipynb_checkpoints/
+
+# Downloaded/generated data
+data/
