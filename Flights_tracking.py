@@ -5,8 +5,8 @@ Classes
 -------
 BaseMap               : departments + airports layers (your existing code)
 AdsbLoader            : reads the .jsonl and returns a clean positions DataFrame
-Trajectory            : one aircraft (icao24), with its callsign and points
-TrajectoryCollection  : all aircraft: iteration, summary, GeoDataFrame export
+Flights            : one aircraft (icao24), with its callsign and points
+FlightsCollection  : all aircraft: iteration, summary, GeoDataFrame export
 MapPlotter            : draws base map + airports + trajectories
 
 .env must define URL_IDF, URL_AIRPORTS and URL_Avions_MCD.
@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Optional
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -26,10 +27,6 @@ from shapely.geometry import LineString
 
 load_dotenv()
 
-
-# --------------------------------------------------------------------------- #
-# Base map
-# --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Airfield:
     """A named airfield drawn as a marker (for airfields missing from your shapefile)."""
@@ -39,21 +36,18 @@ class Airfield:
 
 
 class BaseMap:
-    """Petite + Grande Couronne, airports and extra airfields, all in one CRS."""
+    """Petite + Grande Couronne, airports and extra airfields."""
 
     PETITE_COURONNE = ("75", "92", "93", "94")
     GRANDE_COURONNE = ("77", "78", "91", "95")
-
-    # West of Orly (approx. airfield reference points)
     DEFAULT_AIRFIELDS = (
         Airfield("Villacoublay", 48.7743, 2.2019),
         Airfield("Toussus-le-Noble", 48.7519, 2.1061),
     )
 
-    def __init__(self, idf_path: str, airports_path: str, epsg: int = 4326,
-                 include_grande_couronne: bool = True,
-                 airfields: tuple[Airfield, ...] = DEFAULT_AIRFIELDS):
+    def __init__(self, idf_path: str, airports_path: str, epsg: int = 4326,include_grande_couronne: bool = True,airfields: tuple[Airfield, ...] = DEFAULT_AIRFIELDS):
         self.epsg = epsg
+        
         idf = gpd.read_file(idf_path).to_crs(epsg=epsg)
         idf["CODE_DEPT"] = idf["CODE_DEPT"].astype(str)
 
@@ -85,9 +79,6 @@ class BaseMap:
         return self.petite_couronne.total_bounds
 
 
-# --------------------------------------------------------------------------- #
-# CPR decoding (airborne positions, 17-bit)
-# --------------------------------------------------------------------------- #
 class CprDecoder:
     """
     Local CPR decoding: lat/lon from ONE message + a reference position
@@ -122,10 +113,6 @@ class CprDecoder:
             0.5 + (self.ref_lon % d_lon) / d_lon - lon_c)
         return lat, d_lon * (m + lon_c)
 
-
-# --------------------------------------------------------------------------- #
-# ADS-B loading
-# --------------------------------------------------------------------------- #
 class AdsbLoader:
     """
     Position messages (latitude/longitude) do NOT contain the callsign:
@@ -153,7 +140,6 @@ class AdsbLoader:
         if self.decode_missing:
             raw = self._fill_missing_positions(raw)
 
-        # icao24 -> callsign (last non-null value seen)
         callsigns = (
             raw.dropna(subset=["callsign"])
             .assign(callsign=lambda d: d["callsign"].str.strip().str.rstrip("_"))
@@ -175,12 +161,8 @@ class AdsbLoader:
             .reset_index(drop=True)
         )
 
-
-# --------------------------------------------------------------------------- #
-# One aircraft
-# --------------------------------------------------------------------------- #
 @dataclass
-class Trajectory:
+class Flights:
     icao24: str
     data: pd.DataFrame  # sorted by timestamp
 
@@ -229,47 +211,42 @@ class Trajectory:
         ]
 
     def __repr__(self) -> str:
-        return f"Trajectory({self.label!r}, {len(self)} pts)"
+        return f"Flights({self.label!r}, {len(self)} pts)"
 
-
-# --------------------------------------------------------------------------- #
-# All aircraft
-# --------------------------------------------------------------------------- #
-class TrajectoryCollection:
-    def __init__(self, trajectories: list[Trajectory]):
+class FlightsCollection:
+    def __init__(self, trajectories: list[Flights]):
         self._trajs = trajectories
 
     @classmethod
-    def from_dataframe(cls, df: pd.DataFrame) -> "TrajectoryCollection":
-        return cls([Trajectory(icao, chunk.reset_index(drop=True))
+    def from_dataframe(cls, df: pd.DataFrame) -> "FlightsCollection":
+        return cls([Flights(icao, chunk.reset_index(drop=True))
                     for icao, chunk in df.groupby("icao24")])
 
     def __len__(self) -> int:
         return len(self._trajs)
 
-    def __iter__(self) -> Iterator[Trajectory]:
+    def __iter__(self) -> Iterator[Flights]:
         return iter(self._trajs)
 
-    def filter_min_points(self, n: int) -> "TrajectoryCollection":
-        return TrajectoryCollection([t for t in self._trajs if len(t) >= n])
+    def filter_min_points(self, n: int) -> "FlightsCollection":
+        return FlightsCollection([t for t in self._trajs if len(t) >= n])
 
-    def filter_low_altitude(self, threshold_ft: float = 3000) -> "TrajectoryCollection":
-        """Keep aircraft that go below threshold_ft at some point
-        (= probable takeoffs / landings). The whole track is kept."""
-        return TrajectoryCollection(
+    def filter_low_altitude(self, threshold_ft: float = 3000) -> "FlightsCollection":
+        
+        return FlightsCollection(
             [t for t in self._trajs
              if t.min_altitude is not None and t.min_altitude < threshold_ft]
         )
 
-    def crop_to_bbox(self, minx, miny, maxx, maxy) -> "TrajectoryCollection":
+    def crop_to_bbox(self, minx, miny, maxx, maxy) -> "FlightsCollection":
         """Keep only the position points inside a lon/lat box (removes outliers)."""
         out = []
         for t in self._trajs:
             d = t.data
             d = d[d["longitude"].between(minx, maxx) & d["latitude"].between(miny, maxy)]
             if len(d):
-                out.append(Trajectory(t.icao24, d.reset_index(drop=True)))
-        return TrajectoryCollection(out)
+                out.append(Flights(t.icao24, d.reset_index(drop=True)))
+        return FlightsCollection(out)
 
     def summary(self) -> pd.DataFrame:
         """Replaces your groupby('callsign').agg(...) -- but on icao24."""
@@ -302,14 +279,14 @@ class MapPlotter:
         self.basemap = basemap
         self.figsize = figsize
 
-    def diagnose(self, trajectories: TrajectoryCollection) -> None:
+    def diagnose(self, trajectories: FlightsCollection) -> None:
         """Compare the extents (lon/lat) of the base map and the trajectories."""
         g = trajectories.to_geodataframe(epsg=self.basemap.epsg)
         print("basemap      [minx miny maxx maxy]:", self.basemap.bounds.round(3))
         print("trajectories [minx miny maxx maxy]:", g.total_bounds.round(3))
         print("basemap CRS:", self.basemap.departments.crs)
 
-    def plot(self, trajectories: TrajectoryCollection,
+    def plot(self, trajectories: FlightsCollection,
              max_gap_s: Optional[float] = None,
              zoom_on: str = "basemap",   # "basemap" | "petite_couronne" | "trajectories"
              color_by_altitude: bool = True,
@@ -363,19 +340,16 @@ if __name__ == "__main__":
     basemap = BaseMap.from_env()
     positions = AdsbLoader(os.environ["URL_Avions_MCD"]).load()
 
-    trajs = TrajectoryCollection.from_dataframe(positions).filter_min_points(5)
+    trajs = FlightsCollection.from_dataframe(positions).filter_min_points(5)
     print(trajs.summary())
 
     plotter = MapPlotter(basemap)
     plotter.diagnose(trajs)
-
-    # keep only what is around the Petite Couronne (drops far-away / wrong points)
     minx, miny, maxx, maxy = basemap.bounds
-    pad = 0.3  # degrees
+    pad = 0.3
     local = trajs.crop_to_bbox(minx - pad, miny - pad, maxx + pad, maxy + pad)
     print(len(local), "aircraft near the Petite Couronne")
 
-    # only takeoffs / landings: below 3000 ft at some point
     local = local.filter_low_altitude(3000)
     print(len(local), "aircraft below 3000 ft (takeoff / landing)")
     print(local.summary())
