@@ -14,3 +14,7 @@ geoflar-departements/
 *.sbx
 *.qix
 *.env
+# Python environment
+.venv/
+__pycache__/
+.ipynb_checkpoints/
