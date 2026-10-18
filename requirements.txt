@@ -2,3 +2,7 @@ geopandas>=1.0
 matplotlib>=3.9
 python-dotenv>=1.0
 ipykernel>=6.29
+
+# Type checking only
+mypy>=1.13
+pandas-stubs>=3.0
