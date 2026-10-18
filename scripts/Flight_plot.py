@@ -8,7 +8,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 class Flight:
 
     def __lt__(a, b):
@@ -88,6 +87,9 @@ class FlightCollection:
         return f"FlightCollection with {len(self)} flights"
 
     COLONNES: list[str] = ["timestamp","icao24", "callsign", "latitude", "longitude","altitude","vertical_rate"]
+    PETITE_COURONNE = ("75", "92", "93", "94")
+    GRANDE_COURONNE = ("77", "78", "91", "95")
+    EXTRA_AIRFIELDS = {"Toussus-le-Noble": (48.7519, 2.1061),"Etampes-Mondesir": (48.3822, 2.0653)}
 
     @classmethod
     def read_json(cls, *filenames):
@@ -155,36 +157,28 @@ class FlightCollection:
         return result
 
 
-class BaseMap:
-    PETITE_COURONNE = ("75", "92", "93", "94")
-    GRANDE_COURONNE = ("77", "78", "91", "95")
-    EXTRA_AIRFIELDS = {"Toussus-le-Noble": (48.7519, 2.1061),"Etampes-Mondesir": (48.3822, 2.0653)}
-
-    def __init__(self, idf_path, airports_path, epsg=4326):
-        self.epsg = epsg
-        idf = gpd.read_file(idf_path).to_crs(epsg=epsg)
-        idf["CODE_DEPT"] = idf["CODE_DEPT"].astype(str)
-        self.petite_couronne = idf[idf["CODE_DEPT"].isin(self.PETITE_COURONNE)]
-        self.grande_couronne = (idf[idf["CODE_DEPT"].isin(self.GRANDE_COURONNE)])
-        self.departments = pd.concat([self.petite_couronne, self.grande_couronne])
-        self.airports = gpd.read_file(airports_path).to_crs(epsg=epsg)
-
-        names = list(self.EXTRA_AIRFIELDS)
-        lats = [self.EXTRA_AIRFIELDS[n][0] for n in names]
-        lons = [self.EXTRA_AIRFIELDS[n][1] for n in names]
-        self.airfields = gpd.GeoDataFrame({"name": names}, geometry=gpd.points_from_xy(lons, lats), crs=4326).to_crs(epsg=epsg)
-
     @classmethod
-    def from_env(cls, epsg=4326, **kwargs):
-        return cls(os.environ["URL_IDF"], os.environ["URL_AIRPORTS"], epsg, **kwargs)
+    def plot_map(cls, ax):
+        """Draw the Ile-de-France background on ax. Returns the outline of the departments."""
+        idf = gpd.read_file(os.environ["URL_IDF"]).to_crs(epsg=4326)
+        idf["CODE_DEPT"] = idf["CODE_DEPT"].astype(str)
+        petite_couronne = idf[idf["CODE_DEPT"].isin(cls.PETITE_COURONNE)]
+        grande_couronne = idf[idf["CODE_DEPT"].isin(cls.GRANDE_COURONNE)]
+        airports = gpd.read_file(os.environ["URL_AIRPORTS"]).to_crs(epsg=4326)
 
-    @property
-    def bounds(self):
-        return self.departments.total_bounds
+        names = list(cls.EXTRA_AIRFIELDS)
+        lats = [cls.EXTRA_AIRFIELDS[n][0] for n in names]
+        lons = [cls.EXTRA_AIRFIELDS[n][1] for n in names]
+        airfields = gpd.GeoDataFrame({"name": names}, geometry=gpd.points_from_xy(lons, lats), crs=4326)
 
-    @property
-    def petite_couronne_bounds(self):
-        return self.petite_couronne.total_bounds
+        grande_couronne.plot(ax=ax, color="#D9D6D6",edgecolor="#6B6868", linewidth=0.3)
+        petite_couronne.plot(ax=ax, color="#A29F9F",edgecolor="#0A0909", linewidth=0.5)
+        airports.plot(ax=ax, color="#A29F9F",edgecolor="#EE0808", linewidth=0.5)
+        airfields.plot(ax=ax, color="#EE0808", marker="^", markersize=25, zorder=5)
+        for _, a in airfields.iterrows():
+            ax.annotate(a["name"], (a.geometry.x, a.geometry.y), fontsize=7,xytext=(4, 4), textcoords="offset points", zorder=6)
+
+        return pd.concat([petite_couronne, grande_couronne]).union_all()
 
 
 def keep_inside_idf(data, boundary):
@@ -200,20 +194,12 @@ def flight_min_altitudes(collection):
     return mins
 
 
-basemap = BaseMap.from_env()
-files = [os.environ["URL_Avions_MCD"]]  + [os.environ["URL_Avions_AT"]] + [os.environ["URL_Avions_AF"]] + [os.environ["URL_Avions_TC"]] + [os.environ["URL_Avions_R"]]
+files =[os.environ["URL_Avions_MCD"]]  + [os.environ["URL_Avions_AT"]] + [os.environ["URL_Avions_AF"]] + [os.environ["URL_Avions_TC"]] + [os.environ["URL_Avions_R"]]
 collection = FlightCollection.read_json(*files)
 
 fig, ax = plt.subplots(figsize=(10, 6))
 
-basemap.grande_couronne.plot(ax=ax, color="#D9D6D6",edgecolor="#6B6868", linewidth=0.3)
-basemap.petite_couronne.plot(ax=ax, color="#A29F9F",edgecolor="#0A0909", linewidth=0.5)
-basemap.airports.plot(ax=ax, color="#A29F9F",edgecolor="#EE0808", linewidth=0.5)
-basemap.airfields.plot(ax=ax, color="#EE0808", marker="^", markersize=25, zorder=5)
-for _, a in basemap.airfields.iterrows():
-    ax.annotate(a["name"], (a.geometry.x, a.geometry.y), fontsize=7,xytext=(4, 4), textcoords="offset points", zorder=6)
-
-idf_boundary = basemap.departments.union_all()
+idf_boundary = FlightCollection.plot_map(ax)
 
 ax.plot([], [], color="C0", label="Landing")
 ax.plot([], [], color="C1", label="Takeoff")
