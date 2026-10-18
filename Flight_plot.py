@@ -91,7 +91,7 @@ class FlightCollection:
     def __repr__(self):
         return f"FlightCollection with {len(self)} flights"
 
-    COLONNES = ["timestamp","icao24", "callsign", "latitude", "longitude","altitude","vertical_rate"]
+    COLONNES: list[str] = ["timestamp","icao24", "callsign", "latitude", "longitude","altitude","vertical_rate"]
 
     @classmethod
     def read_json(cls, *filenames):
@@ -125,7 +125,7 @@ class FlightCollection:
 
     def avg_vrates(self):
         moy = []
-        for i, flight in enumerate(self):
+        for _, flight in enumerate(self):
             vr = flight.avg_vrate()
             if pd.notna(vr):
                 moy.append(vr)
