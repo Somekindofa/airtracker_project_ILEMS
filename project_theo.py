@@ -1,4 +1,5 @@
-import argparse
+import os
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -7,56 +8,101 @@ from cartopy.crs import EuroPP, PlateCarree
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 
-CACHE = "data/flights_clean.pkl.gz"
-START_UTC = pd.Timestamp("2026-10-15 13:00")
+CACHE = "data/flights_clean.pkl.gz"             # so that we don'tt reload the whole db evertime
+OUT = "output/landing_takeoff.png"              # final png of the landings and take offs
+START_UTC = pd.Timestamp("2026-10-15 13:00")    # the UTC is UTC+0 in the dataset... we'll convert later
 END_UTC = pd.Timestamp("2026-10-15 14:00")
-GAP_S = 300  # silence (s) after which a new flight starts
-LOW_FT = 500  # a flight has to go below this altitude
-CUT_FT = 1500  # |altitude change| above this = landing / take off, below = low flyer
-MAX_JOIN_S = 60  # no line between two points further apart than this
-VMAX_FT = 12000  # everything above is just blue
+GAP_S = 300                                     # silence (s) after which a new flight starts
+LOW_FT = 400                                    # a flight has to go below this altitude
+CUT_FT = 1500                                   # above this = landing or take off, below = low flyer
+MAX_JOIN_S = 60                                 # no line between two points further apart than this
+VMAX_FT = 12000                                 # everything above is just blue (better visuals)
 
 
-def load_positions(cache=CACHE):
-    """Rows of the capture hour that have altitude, latitude and longitude, sorted by time."""
-    cols = ["timestamp", "icao24", "altitude", "latitude", "longitude"]
-    data = pd.read_pickle(cache)[cols]  # our own cache, built from the group files (pickle is fine here)
+def iterate_time(data: pd.DataFrame, threshold):
+    idx = np.where(data.timestamp.diff().dt.total_seconds() > threshold)[0]
+    start = 0
+    for stop in idx:
+        yield data.iloc[start:stop]
+        start = stop
+    yield data.iloc[start:]
+
+
+class Flight:
+    def __init__(self, data: pd.DataFrame):
+        self.data = data
+
+    def __repr__(self):
+        return f"Flight with icao24 {self.icao24} and {len(self.data)} rows"
+
+    def max(self, feature):
+        return self.data[feature].max()
+
+    def min(self, feature):
+        return self.data[feature].min()
+
+    @property
+    def icao24(self):
+        return self.min("icao24")
+
+
+class FlightCollection:
+    def __init__(self, data: pd.DataFrame):
+        self.data = data
+
+    def __repr__(self):
+        return f"FlightCollection with {len(self)} flights"
+
+    @classmethod
+    def read_pickle(cls, pkl):
+        # our own pickel cache, built from the group files
+        return cls(pd.read_pickle(pkl))
+
+    def __iter__(self):
+        for _, group in self.data.groupby(by="icao24"):
+            for elt in iterate_time(group, GAP_S):
+                yield Flight(elt)
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+
+def load_flights(cache=CACHE):
+    """FlightCollection of the capture hour, rows that have altitude, latitude and longitude."""
+    data = FlightCollection.read_pickle(cache).data
 
     # the clock is UTC; this also drops Chatou (recorded the evening before)
     data = data[(data["timestamp"] >= START_UTC) & (data["timestamp"] < END_UTC)].copy()
     data["timestamp"] = data["timestamp"] + pd.Timedelta(hours=2)
 
-    return (
-        data.query("0 < altitude < 45000 & longitude.notna() & latitude.notna()")
-        .sort_values(["icao24", "timestamp"])
-        .reset_index(drop=True)
-    )
+    data = data.query("0 < altitude < 45000 & longitude.notna() & latitude.notna()").sort_values("timestamp")
+    return FlightCollection(data)
 
 
-def split_flights(pos):
-    """Add a flight_id column: new flight when the aircraft changes or goes silent for GAP_S."""
-    new = (pos["icao24"] != pos["icao24"].shift()) | (pos["timestamp"].diff().dt.total_seconds() > GAP_S)
-    return pos.assign(flight_id=new.cumsum())
-
-
-def select_landings_takeoffs(pos):
-    """Return the flight ids of the landings and of the take offs."""
-    alt = pos.groupby("flight_id")["altitude"]
-    went_low = alt.min() < LOW_FT
-    change = alt.last() - alt.first()  # rows are sorted by time inside a flight
-    landings = change.index[went_low & (change < -CUT_FT)]
-    takeoffs = change.index[went_low & (change > CUT_FT)]
+def select_landings_takeoffs(fc):
+    """Return the landings and the take offs, as lists of Flight."""
+    landings, takeoffs = [], []
+    for flight in fc:
+        if flight.min("altitude") >= LOW_FT:
+            continue
+        alt = flight.data["altitude"]  # rows are sorted by time inside a flight
+        change = alt.iloc[-1] - alt.iloc[0]
+        if change < -CUT_FT:
+            landings.append(flight)
+        elif change > CUT_FT:
+            takeoffs.append(flight)
     return landings, takeoffs
 
 
-def plot(pos, flight_ids, title, idf, runways):
+def plot(flights, title, idf, runways):
     norm = Normalize(vmin=0, vmax=VMAX_FT)
     fig, ax = plt.subplots(figsize=(10, 10), subplot_kw={"projection": EuroPP()})
 
     idf.plot(ax=ax, transform=PlateCarree(), color="#A29F9F", edgecolor="#0A0909", linewidth=0.5)
     runways.plot(ax=ax, transform=PlateCarree(), color="#EE0808", linewidth=1)
 
-    for _, d in pos[pos["flight_id"].isin(flight_ids)].groupby("flight_id"):
+    for flight in flights:
+        d = flight.data
         pts = np.column_stack([d["longitude"], d["latitude"]]).reshape(-1, 1, 2)
         segments = np.concatenate([pts[:-1], pts[1:]], axis=1)
         alt = d["altitude"].to_numpy()
@@ -69,26 +115,24 @@ def plot(pos, flight_ids, title, idf, runways):
     fig.colorbar(lc, ax=ax, shrink=0.6, label="Altitude (ft)")
     minx, miny, maxx, maxy = idf.total_bounds
     ax.set_extent((minx, maxx, miny, maxy), crs=PlateCarree())
+    ax.set_aspect("equal")  # geopandas' plot() sets 1/cos(lat) on lon/lat data, which stretches the map in EuroPP
     ax.set_title(title)
     return fig
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-o", "--out", default="output/project_theo.png")
-    args = ap.parse_args()
-
-    pos = split_flights(load_positions())
-    landings, takeoffs = select_landings_takeoffs(pos)
-    print(f"{pos['flight_id'].nunique()} flights, {len(landings)} landings, {len(takeoffs)} take offs")
+    fc = load_flights()
+    landings, takeoffs = select_landings_takeoffs(fc)
+    print(f"{len(fc)} flights, {len(landings)} landings, {len(takeoffs)} take offs")
 
     idf = gpd.read_file("geoflar-departements/geoflar-departements.shp").to_crs(epsg=4326)
     runways = gpd.read_file("aeroports-dile-de-france/export_runways.geojson").to_crs(epsg=4326)
 
     title = f"{len(landings)} landings and {len(takeoffs)} take offs, 3pm to 4pm"
-    fig = plot(pos, landings.union(takeoffs), title, idf, runways)
-    fig.savefig(args.out, dpi=130, bbox_inches="tight", facecolor="white")
-    print("saved", args.out)
+    fig = plot(landings + takeoffs, title, idf, runways)
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    fig.savefig(OUT, dpi=130, bbox_inches="tight", facecolor="white")
+    print("saved", OUT)
 
 
 if __name__ == "__main__":

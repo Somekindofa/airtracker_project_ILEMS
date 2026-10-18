@@ -73,12 +73,8 @@ def iterate_icao24_callsign(data):
 
 def iterate_time(data, max_gap_s):
     data = data.sort_values("timestamp")
-    gap = data["timestamp"].diff()
-    if pd.api.types.is_timedelta64_dtype(gap):
-        threshold = pd.Timedelta(seconds=max_gap_s)
-    else:
-        threshold = max_gap_s
-    segment = (gap > threshold).cumsum()
+    gap = data["timestamp"].diff().dt.total_seconds()
+    segment = (gap > max_gap_s).cumsum()
     for _, chunk in data.groupby(segment):
         yield chunk
 
